@@ -1,4 +1,4 @@
-# TD Web Broker Dividend Importer (v6.1)
+# TD Web Broker Dividend Importer
 
 A specialized Google Apps Script tool designed to automate dividend income tracking from TD Web Broker Activity exports. This script is engineered to handle multi-currency portfolios (CAD/USD), non-resident withholding taxes, and high-frequency (weekly) dividend distributions.
 
