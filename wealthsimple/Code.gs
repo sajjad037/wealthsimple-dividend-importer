@@ -5,13 +5,6 @@
 
 const LOG_SHEET_NAME = "Import_WS_TFSA_Log_DoNotDelete";
 
-function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('💰 Dividend Tools')
-      .addItem('Import Wealthsimple CSV', 'importMonthlyDividends')
-      .addToUi();
-}
-
 function importMonthlyDividends() {
   const html = HtmlService.createHtmlOutput(
     '<div style="font-family: Arial; padding: 15px;">' +

@@ -1,34 +1,39 @@
 /**
- * TD WEB BROKER DIVIDEND IMPORTER (v6.1)
- * Optimized for: 
- * - Tax Subtraction: Automatically deducts WHTX02 from DIV/TXPDDV.
- * - Weekly Stacking: Sums multiple payments into the same monthly cell.
- * - Flex-Context: Scans Row 1 of your tab for Account ID (e.g., 46J3Y8K).
+ * TD WEB BROKER DIVIDEND IMPORTER (v6.5)
+ * - Fixed: Progress Bar logic.
+ * - Fixed: Forced Date Object headers to prevent "Jun-2026" jump.
  */
 
-const CONFIG_SHEET_NAME = "Config_TD";
-const LOG_SHEET_NAME = "Import_TD_Log_DoNotDelete";
+const TD_CONFIG_NAME = "Config_TD";
+const TD_LOG_NAME = "Import_TD_Log_DoNotDelete";
 
+/**
+ * MASTER MENU LOADER
+ * This function creates BOTH menus at once.
+ * IMPORTANT: Delete any 'onOpen' functions in your other .gs files.
+ */
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu('🏦 TD Tools')
+  const ui = SpreadsheetApp.getUi();
+  
+  // 1. Create the Wealthsimple Menu
+  // Replace 'showUploadDialog' with the exact name of the function in your WS script
+  ui.createMenu('💰 WS Tools')
+      .addItem('Import Wealthsimple CSV', 'importMonthlyDividends') 
+      .addToUi();
+
+  // 2. Create the TD Menu
+  ui.createMenu('🏦 TD Tools')
       .addItem('Import TD Activity CSV', 'showTdUploadDialog')
       .addToUi();
 }
 
 function showTdUploadDialog() {
   const html = HtmlService.createHtmlOutput(
-    '<div style="font-family: Arial; padding: 15px;">' +
-    '<p><b>Select TD Activity CSV:</b></p>' +
+    '<div style="font-family: Arial; padding: 15px;"><p><b>Select TD Activity CSV:</b></p>' +
     '<input type="file" id="file" onchange="upload(this)">' +
-    '<script>' +
-    'function upload(f) {' +
-    '  const reader = new FileReader();' +
-    '  reader.onload = function(e) {' +
-    '    google.script.run.withSuccessHandler(() => { google.script.host.close(); }).startProcessing(e.target.result);' +
-    '  };' +
-    '  reader.readAsText(f.files[0]);' +
-    '}' +
-    '</script></div>'
+    '<script>function upload(f) { const reader = new FileReader(); reader.onload = function(e) { ' +
+    'google.script.run.withSuccessHandler(() => { google.script.host.close(); }).startProcessing(e.target.result); }; ' +
+    'reader.readAsText(f.files[0]); }</script></div>'
   ).setWidth(350).setHeight(150);
   SpreadsheetApp.getUi().showModalDialog(html, 'TD Dividend Importer');
 }
@@ -38,94 +43,127 @@ function startProcessing(csvContent) {
   const activeSheet = ss.getActiveSheet();
   const rawLines = csvContent.split(/\r?\n/);
   
-  // 1. DYNAMIC ID SEARCH (Scan Row 1)
-  const firstRowValues = activeSheet.getRange("1:1").getValues()[0].map(v => v.toString().trim());
+  // 1. Account ID Check
   const accountLine = rawLines[1] || "";
   const csvAccountId = (accountLine.match(/(\w+)$/) || [])[1];
+  const row1Values = activeSheet.getRange("1:1").getValues()[0].map(v => v.toString().trim());
 
-  if (!firstRowValues.includes(csvAccountId)) {
-    SpreadsheetApp.getUi().alert(`❌ CONTEXT ERROR\n\nCSV ID (${csvAccountId}) not found in Row 1 of this tab.\n\nPlease check that you are on the correct tab.`);
+  if (!row1Values.includes(csvAccountId)) {
+    SpreadsheetApp.getUi().alert("❌ ID Mismatch: CSV shows " + csvAccountId + " but not found in Row 1.");
     return;
   }
 
-  // 2. PARSE AND AGGREGATE (Net Calculation)
+  // 2. Parse CSV
   const csvData = Utilities.parseCsv(rawLines.slice(3).join("\n"));
+  if (csvData.length < 2) return;
+
   const headers = csvData[0].map(h => h.trim().toLowerCase());
-  const descIdx = headers.indexOf("description"), actionIdx = headers.indexOf("action");
-  const amountIdx = headers.indexOf("net amount"), dateIdx = headers.indexOf("trade date");
+  const descIdx = headers.indexOf("description");
+  const actionIdx = headers.indexOf("action");
+  const amountIdx = headers.indexOf("net amount");
+  const dateIdx = 0; // Trade Date
 
   const logSheet = getOrCreateLogSheet(ss);
   const configSheet = getOrCreateConfigSheet(ss);
-  
-  // Group by Ticker + Date to subtract taxes from gross
   let dailyNetMap = {};
 
+  // 3. Process Rows
   for (let i = 1; i < csvData.length; i++) {
     const row = csvData[i];
+    if (!row[dateIdx] || row[dateIdx].trim() === "") continue;
+
+    if (i % 10 === 0) ss.toast("Step 1: Reading CSV (" + Math.round((i/csvData.length)*100) + "%)");
+
     const action = (row[actionIdx] || "").toString().toUpperCase();
-    const desc = row[descIdx].trim();
-    const date = row[dateIdx];
-    const amount = parseFloat(row[amountIdx]) || 0;
-    const key = `${desc}|${date}`;
+    let desc = (row[descIdx] || "").trim().replace(/\s+CONVERT TO\s+\w+\s+@\s+[\d\.]+/gi, "");
+    
+    // Parse Date Parts: "31 Mar 2026"
+    const dParts = row[dateIdx].split(" ");
+    if (dParts.length < 3) continue;
+    
+    const day = parseInt(dParts[0]);
+    const monthStr = dParts[1].substring(0,3).toLowerCase();
+    const year = parseInt(dParts[2]);
+    const monthMap = {'jan':0,'feb':1,'mar':2,'apr':3,'may':4,'jun':5,'jul':6,'aug':7,'sep':8,'oct':9,'nov':10,'dec':11};
+    const monthIdx = monthMap[monthStr];
+
+    if (monthIdx === undefined) continue;
+
+    // Create a normalized key for grouping
+    const dateKey = `${day}-${monthIdx}-${year}`;
+    const key = `${desc}|${dateKey}|${monthIdx}|${year}`;
 
     if (["TXPDDV", "DIV", "FGN", "INT", "DRIP", "WHTX02"].includes(action)) {
-      dailyNetMap[key] = (dailyNetMap[key] || 0) + amount;
+      const amt = parseFloat(row[amountIdx]) || 0;
+      dailyNetMap[key] = (dailyNetMap[key] || 0) + amt;
     }
   }
 
-  // 3. APPLY NETS TO SHEET
+  // 4. Update Sheet
   let count = 0;
-  for (let key in dailyNetMap) {
-    if (dailyNetMap[key] <= 0) continue; // Skip if tax exceeds dividend or zero
+  const keys = Object.keys(dailyNetMap);
+  for (let j = 0; j < keys.length; j++) {
+    const key = keys[j];
+    if (dailyNetMap[key] === 0) continue;
 
-    const [fullDesc, dateStr] = key.split("|");
-    const ticker = getTickerWithCache(fullDesc, configSheet);
-    const netAmount = dailyNetMap[key];
+    ss.toast("Step 2: Updating Sheet (" + Math.round((j/keys.length)*100) + "%)");
+
+    const [desc, dateKey, mIdx, yr] = key.split("|");
+    const ticker = getTickerWithCache(desc, configSheet);
+    const amount = dailyNetMap[key];
     
-    // Idempotency check
-    const transId = `TD_${csvAccountId}_${ticker}_${dateStr}_${netAmount.toFixed(2)}`;
+    const transId = `TD_${csvAccountId}_${ticker}_${dateKey}_${amount.toFixed(2)}`;
     if (isDuplicate(logSheet, transId)) continue;
 
-    updateTargetSheet(activeSheet, ticker, netAmount, normalizeMonthYear(new Date(dateStr)));
-    logSheet.appendRow([new Date(), transId, ticker, netAmount, activeSheet.getName()]);
+    updateTargetSheet(activeSheet, ticker, amount, parseInt(mIdx), parseInt(yr));
+    logSheet.appendRow([new Date(), transId, ticker, amount, activeSheet.getName()]);
     count++;
   }
-  
-  ss.toast("Import Complete!", "TD Tools");
-  SpreadsheetApp.getUi().alert(`✅ Success: Imported ${count} NET dividend entries into ${activeSheet.getName()}.`);
+  ss.toast("✅ Done! Imported " + count + " entries.");
 }
 
-/** TICKER RESOLUTION **/
-function getTickerWithCache(description, configSheet) {
-  const data = configSheet.getDataRange().getValues();
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][0] === description) return data[i][1];
+function updateTargetSheet(sheet, ticker, amount, mIdx, yr) {
+  const data = sheet.getDataRange().getValues();
+  const headerRow = data[2]; // Row 3
+  
+  // Identify the target month as a Date Object (1st of the month)
+  const targetDate = new Date(yr, mIdx, 1);
+  const targetLabel = Utilities.formatDate(targetDate, "GMT", "MMM-yyyy");
+
+  let sumColIdx = -1;
+  let targetColIdx = -1;
+
+  // Scan Header Row
+  for (let c = 0; c < headerRow.length; c++) {
+    const val = headerRow[c];
+    let label = "";
+    if (val instanceof Date) label = Utilities.formatDate(val, "GMT", "MMM-yyyy");
+    else label = val ? val.toString().trim() : "";
+
+    if (label === "Sum") sumColIdx = c;
+    if (label === targetLabel) targetColIdx = c;
   }
 
-  let tickerGuess = description;
-  try {
-    const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(description)}`;
-    const result = JSON.parse(UrlFetchApp.fetch(url).getContentText());
-    tickerGuess = (result.quotes && result.quotes.length > 0) ? result.quotes[0].symbol.replace(".TO", "") : description;
-  } catch (e) {}
+  // Handle Missing Column
+  if (targetColIdx === -1) {
+    const insertAt = sumColIdx !== -1 ? sumColIdx + 1 : sheet.getLastColumn() + 1;
+    sheet.insertColumnBefore(insertAt);
+    const newCell = sheet.getRange(3, insertAt);
+    newCell.setValue(targetDate);
+    newCell.setNumberFormat("MMM-yyyy");
+    targetColIdx = insertAt - 1;
+  }
 
-  configSheet.appendRow([description, tickerGuess]); 
-  return tickerGuess;
-}
-
-/** UPDATE SHEET (Additive logic for weekly payments) **/
-function updateTargetSheet(sheet, ticker, amount, monthYear) {
-  const data = sheet.getDataRange().getValues();
-  const headers = data[2].map(h => normalizeMonthYear(h)); 
-  let sumColIdx = data[2].indexOf("Sum");
-  let rowIdx = -1, maxSerial = 0, totalRowIdx = -1;
+  // Find or Create Ticker Row
+  let rowIdx = -1;
+  let maxSerial = 0;
+  let totalRowIdx = -1;
 
   for (let r = 0; r < data.length; r++) {
-    const colB = (data[r][1] || "").toString().trim();
     const serial = parseInt(data[r][0]);
     if (!isNaN(serial)) maxSerial = Math.max(maxSerial, serial);
-    if (colB.toLowerCase().includes("total")) totalRowIdx = r + 1;
-    if (r >= 3 && colB === ticker) rowIdx = r;
+    if (data[r][1] && data[r][1].toString().toLowerCase().includes("total")) totalRowIdx = r + 1;
+    if (r >= 3 && data[r][1] === ticker) rowIdx = r;
   }
 
   if (rowIdx === -1) {
@@ -133,44 +171,39 @@ function updateTargetSheet(sheet, ticker, amount, monthYear) {
     sheet.insertRowBefore(totalRowIdx);
     sheet.getRange(totalRowIdx, 1).setValue(maxSerial + 1);
     sheet.getRange(totalRowIdx, 2).setValue(ticker);
-    if (sumColIdx !== -1) {
-      const sumRange = sheet.getRange(totalRowIdx, 3, 1, sumColIdx - 2).getA1Notation();
-      sheet.getRange(totalRowIdx, sumColIdx + 1).setFormula(`=SUM(${sumRange})`);
-    }
     rowIdx = totalRowIdx - 1;
   }
 
-  let colIdx = headers.indexOf(monthYear);
-  if (colIdx === -1) {
-    const insertColAt = sumColIdx !== -1 ? sumColIdx + 1 : sheet.getLastColumn() + 1;
-    sheet.insertColumnBefore(insertColAt);
-    sheet.getRange(3, insertColAt).setValue(monthYear);
-    colIdx = insertColAt - 1;
-  }
-
-  const cell = sheet.getRange(rowIdx + 1, colIdx + 1);
-  const existing = parseFloat(cell.getValue()) || 0;
-  cell.setValue(existing + amount);
+  const cell = sheet.getRange(rowIdx + 1, targetColIdx + 1);
+  cell.setValue((parseFloat(cell.getValue()) || 0) + amount);
 }
 
-function normalizeMonthYear(input) {
-  if (input instanceof Date) return Utilities.formatDate(input, "GMT", "MMM-yyyy");
-  return input ? input.toString().trim() : "";
+function getTickerWithCache(description, configSheet) {
+  const data = configSheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] === description) return data[i][1];
+  }
+  let guess = description;
+  try {
+    const res = JSON.parse(UrlFetchApp.fetch("https://query1.finance.yahoo.com/v1/finance/search?q=" + encodeURIComponent(description)).getContentText());
+    guess = (res.quotes && res.quotes.length > 0) ? res.quotes[0].symbol.replace(".TO", "") : description;
+  } catch (e) {}
+  configSheet.appendRow([description, guess]); 
+  return guess;
 }
 
 function getOrCreateConfigSheet(ss) {
-  let sheet = ss.getSheetByName(CONFIG_SHEET_NAME) || ss.insertSheet(CONFIG_SHEET_NAME);
-  if (sheet.getLastRow() === 0) sheet.appendRow(["Full TD Description", "Mapped Ticker"]);
-  return sheet;
+  return ss.getSheetByName(TD_CONFIG_NAME) || ss.insertSheet(TD_CONFIG_NAME);
 }
 
 function getOrCreateLogSheet(ss) {
-  let log = ss.getSheetByName(LOG_SHEET_NAME) || ss.insertSheet(LOG_SHEET_NAME);
-  if (log.getLastRow() === 0) log.appendRow(["Timestamp", "UniqueID", "Ticker", "Amount", "Tab"]).hideSheet();
+  let log = ss.getSheetByName(TD_LOG_NAME) || ss.insertSheet(TD_LOG_NAME);
+  if (log.getLastRow() === 0) log.appendRow(["Timestamp", "ID", "Ticker", "Amt", "Tab"]).hideSheet();
   return log;
 }
 
 function isDuplicate(logSheet, id) {
-  const ids = logSheet.getRange("B:B").getValues().flat();
+  if (logSheet.getLastRow() < 2) return false;
+  const ids = logSheet.getRange(2, 2, logSheet.getLastRow() - 1, 1).getValues().flat();
   return ids.includes(id);
 }
